@@ -147,6 +147,7 @@ jobs:
         
         # Install dependencies if package.json exists
         if [ -f "package.json" ]; then
+          npm config set registry https://registry.npmjs.org/
           npm install
           
           # Run npm audit
