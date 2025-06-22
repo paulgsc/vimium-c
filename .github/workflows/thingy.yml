@@ -1,0 +1,419 @@
+name: 🛡️ Browser Extension Security Audit
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  schedule:
+    # Run weekly security audit
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+jobs:
+  security-audit:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 🔍 Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for better analysis
+    
+    - name: 📦 Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    # ============================================================================
+    # MANIFEST SECURITY CHECKS
+    # ============================================================================
+    
+    - name: 🔒 Audit Manifest Permissions  
+      run: |
+        echo "=== MANIFEST PERMISSION AUDIT ==="
+        
+        # Check if manifest exists
+        if [ ! -f "manifest.json" ]; then
+          echo "❌ No manifest.json found!"
+          exit 1
+        fi
+        
+        # Extract and analyze permissions
+        echo "📋 Declared Permissions:"
+        jq -r '.permissions[]? // empty' manifest.json | sort
+        
+        # Flag dangerous permissions
+        echo -e "\n🚨 DANGEROUS PERMISSION CHECK:"
+        DANGEROUS_PERMS=("webRequest" "webRequestBlocking" "nativeMessaging" "debugger" "desktopCapture" "management" "system.storage" "unlimitedStorage")
+        
+        for perm in "${DANGEROUS_PERMS[@]}"; do
+          if jq -e --arg perm "$perm" '.permissions[]? | select(. == $perm)' manifest.json > /dev/null; then
+            echo "⚠️  FOUND DANGEROUS: $perm"
+          fi
+        done
+        
+        # Check for overly broad host permissions
+        echo -e "\n🌐 HOST PERMISSION CHECK:"
+        if jq -e '.permissions[]? | select(. == "<all_urls>")' manifest.json > /dev/null; then
+          echo "🚨 CRITICAL: <all_urls> permission detected!"
+        fi
+        
+        if jq -e '.permissions[]? | select(test("\\*://\\*/\\*"))' manifest.json > /dev/null; then
+          echo "⚠️  Broad wildcard host permissions detected"
+        fi
+        
+        # Check content security policy
+        echo -e "\n🛡️ CONTENT SECURITY POLICY:"
+        CSP=$(jq -r '.content_security_policy // "Not defined"' manifest.json)
+        echo "CSP: $CSP"
+        
+        if [[ "$CSP" == *"unsafe-eval"* ]]; then
+          echo "🚨 CRITICAL: unsafe-eval in CSP!"
+        fi
+        
+        if [[ "$CSP" == *"unsafe-inline"* ]]; then
+          echo "⚠️  unsafe-inline in CSP detected"
+        fi
+
+    # ============================================================================
+    # CODE PATTERN SECURITY ANALYSIS  
+    # ============================================================================
+    
+    - name: 🚫 Check for Dangerous Code Patterns
+      run: |
+        echo "=== DANGEROUS CODE PATTERN SCAN ==="
+        
+        # Function to check patterns and report
+        check_pattern() {
+          local pattern="$1"
+          local description="$2"
+          local severity="$3" # CRITICAL, WARNING, INFO
+          
+          echo -e "\n[$severity] Checking: $description"
+          
+          matches=$(grep -rn --include="*.js" --include="*.ts" -E "$pattern" . || true)
+          if [ -n "$matches" ]; then
+            echo "🚨 FOUND:"
+            echo "$matches"
+            if [ "$severity" = "CRITICAL" ]; then
+              echo "SECURITY_CRITICAL=true" >> $GITHUB_ENV
+            fi
+          else
+            echo "✅ Clean"
+          fi
+        }
+        
+        # Initialize security flag
+        echo "SECURITY_CRITICAL=false" >> $GITHUB_ENV
+        
+        # Dangerous eval patterns
+        check_pattern "eval\s*\(|new\s+Function\s*\(|setTimeout\s*\(\s*['\"]|setInterval\s*\(\s*['\"]" "Dynamic code execution (eval, new Function, string timeouts)" "CRITICAL"
+        
+        # Network calls
+        check_pattern "fetch\s*\(|XMLHttpRequest|WebSocket|sendBeacon" "Network requests" "WARNING"
+        
+        # DOM manipulation sinks
+        check_pattern "innerHTML\s*=|outerHTML\s*=|document\.write|insertAdjacentHTML" "DOM injection sinks" "WARNING"
+        
+        # File/Download operations
+        check_pattern "chrome\.downloads|navigator\.msSaveBlob|createObjectURL|FileReader|Blob\s*\(" "File operations" "WARNING"
+        
+        # Native messaging
+        check_pattern "chrome\.runtime\.connectNative|nativeMessaging" "Native messaging" "CRITICAL"
+        
+        # External script loading
+        check_pattern "script\.src\s*=|import\s*\(|loadScript|createElement\s*\(\s*['\"]script" "Dynamic script loading" "CRITICAL"
+        
+        # Crypto/encoding (could hide malicious data)
+        check_pattern "atob\s*\(|btoa\s*\(|fromCharCode|String\.fromCharCode" "Base64/Encoding operations" "INFO"
+        
+        # External URLs in code
+        echo -e "\n[INFO] Extracting all URLs:"
+        grep -rho --include="*.js" --include="*.ts" -E 'https?://[^"'\'' ]+' . | sort -u || echo "No URLs found"
+
+    # ============================================================================
+    # DEPENDENCY SECURITY AUDIT
+    # ============================================================================
+    
+    - name: 📦 NPM Security Audit
+      if: hashFiles('package.json') != ''
+      run: |
+        echo "=== NPM DEPENDENCY AUDIT ==="
+        
+        # Install dependencies if package.json exists
+        if [ -f "package.json" ]; then
+          npm install --package-lock-only
+          
+          # Run npm audit
+          echo "Running npm audit..."
+          npm audit --audit-level=moderate || echo "Audit found issues"
+          
+          # Generate audit report
+          npm audit --json > npm-audit.json 2>/dev/null || echo "{}" > npm-audit.json
+          
+          # Check for high/critical vulnerabilities
+          HIGH_VULN=$(jq '.metadata.vulnerabilities.high // 0' npm-audit.json)
+          CRITICAL_VULN=$(jq '.metadata.vulnerabilities.critical // 0' npm-audit.json)
+          
+          echo "High vulnerabilities: $HIGH_VULN"
+          echo "Critical vulnerabilities: $CRITICAL_VULN"
+          
+          if [ "$CRITICAL_VULN" -gt 0 ]; then
+            echo "SECURITY_CRITICAL=true" >> $GITHUB_ENV
+          fi
+        fi
+
+    # ============================================================================
+    # STATIC ANALYSIS WITH SEMGREP (FREE)
+    # ============================================================================
+    
+    - name: 🔬 Semgrep Static Analysis
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: >-
+          p/security-audit
+          p/javascript
+          p/typescript
+          p/owasp-top-ten
+      env:
+        SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      continue-on-error: true
+
+    # ============================================================================
+    # SECRETS DETECTION
+    # ============================================================================
+    
+    - name: 🔐 Secret Detection with TruffleHog
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: main
+        head: HEAD
+        extra_args: --debug --only-verified
+      continue-on-error: true
+
+    # ============================================================================
+    # CODE QUALITY & OBFUSCATION CHECK
+    # ============================================================================
+    
+    - name: 🧹 Code Quality & Obfuscation Check
+      run: |
+        echo "=== CODE QUALITY ANALYSIS ==="
+        
+        # Check for obfuscated code patterns
+        echo "🔍 Checking for code obfuscation..."
+        
+        # Look for suspicious variable names (common in obfuscated JS)
+        OBFUSCATED=$(find . -name "*.js" -not -path "./node_modules/*" -not -path "./vendor/*" -not -path "./lib/*" | xargs grep -l '_0x[0-9a-f]\|var [a-zA-Z_$][a-zA-Z0-9_$]\{1,2\}=' || true)
+        
+        if [ -n "$OBFUSCATED" ]; then
+          echo "⚠️  Potentially obfuscated files found:"
+          echo "$OBFUSCATED"
+        else
+          echo "✅ No obvious obfuscation detected"
+        fi
+        
+        # Check code complexity/readability
+        echo -e "\n📊 Code complexity check..."
+        find . -name "*.js" -not -path "./node_modules/*" | head -10 | while read file; do
+          lines=$(wc -l < "$file")
+          if [ "$lines" -gt 1000 ]; then
+            echo "⚠️  Large file (${lines} lines): $file"
+          fi
+        done
+
+    # ============================================================================
+    # DEPENDENCY ANALYSIS
+    # ============================================================================
+    
+    - name: 🔗 Analyze Dependencies and Licenses
+      if: hashFiles('package.json') != ''
+      run: |
+        echo "=== DEPENDENCY ANALYSIS ==="
+        
+        # Install license checker
+        npm install -g license-checker
+        
+        # Check for problematic licenses
+        echo "📄 License analysis:"
+        license-checker --onlyAllow 'MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;Unlicense;WTFPL' --summary || echo "Some dependencies have restrictive licenses"
+        
+        # List all dependencies
+        echo -e "\n📦 All dependencies:"
+        npm list --all --depth=0 2>/dev/null || echo "Could not list dependencies"
+
+    # ============================================================================
+    # GITHUB SECURITY FEATURES
+    # ============================================================================
+    
+    - name: 🛡️ Initialize CodeQL
+      uses: github/codeql-action/init@v2
+      with:
+        languages: javascript
+      continue-on-error: true
+    
+    - name: 🔍 Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+      continue-on-error: true
+
+    # ============================================================================
+    # ADDITIONAL FREE SECURITY TOOLS
+    # ============================================================================
+    
+    - name: 🕷️ ESLint Security Plugin
+      if: hashFiles('package.json') != ''
+      run: |
+        echo "=== ESLINT SECURITY SCAN ==="
+        
+        # Install ESLint security plugins
+        npm install --no-save eslint eslint-plugin-security eslint-plugin-no-unsanitized
+        
+        # Create ESLint config for security
+        cat > .eslintrc.security.js << 'EOF'
+        module.exports = {
+          plugins: ['security', 'no-unsanitized'],
+          extends: ['plugin:security/recommended'],
+          rules: {
+            'no-unsanitized/method': 'error',
+            'no-unsanitized/property': 'error',
+            'security/detect-eval-with-expression': 'error',
+            'security/detect-non-literal-fs-filename': 'error',
+            'security/detect-unsafe-regex': 'error'
+          }
+        };
+        EOF
+        
+        # Run security-focused ESLint
+        npx eslint --config .eslintrc.security.js --ext .js,.ts . || echo "ESLint security scan completed with issues"
+
+    # ============================================================================
+    # CUSTOM SECURITY CHECKS
+    # ============================================================================
+    
+    - name: 🛠️ Custom Security Checks
+      run: |
+        echo "=== CUSTOM SECURITY VALIDATION ==="
+        
+        # Check for hardcoded credentials patterns
+        echo "🔑 Checking for hardcoded secrets..."
+        SECRET_PATTERNS=(
+          "password\s*[:=]\s*['\"][^'\"]{8,}"
+          "api[_-]?key\s*[:=]\s*['\"][^'\"]{16,}"
+          "secret\s*[:=]\s*['\"][^'\"]{16,}"
+          "token\s*[:=]\s*['\"][^'\"]{16,}"
+          "-----BEGIN [A-Z ]+-----"
+        )
+        
+        for pattern in "${SECRET_PATTERNS[@]}"; do
+          matches=$(grep -ri --include="*.js" --include="*.ts" --include="*.json" -E "$pattern" . || true)
+          if [ -n "$matches" ]; then
+            echo "⚠️  Potential secret found: $pattern"
+            echo "$matches" | head -3
+          fi
+        done
+        
+        # Check for suspicious external domains
+        echo -e "\n🌐 External domain analysis..."
+        EXTERNAL_DOMAINS=$(grep -rho --include="*.js" --include="*.ts" -E 'https?://[^/"\'' ]+' . | sed 's|https\?://||' | cut -d/ -f1 | sort -u || true)
+        
+        if [ -n "$EXTERNAL_DOMAINS" ]; then
+          echo "External domains found:"
+          echo "$EXTERNAL_DOMAINS"
+          
+          # Flag suspicious TLDs
+          SUSPICIOUS_TLDS=$(echo "$EXTERNAL_DOMAINS" | grep -E '\.(tk|ml|ga|cf|cc|pw|top|xyz|click)$' || true)
+          if [ -n "$SUSPICIOUS_TLDS" ]; then
+            echo "⚠️  Suspicious TLDs detected:"
+            echo "$SUSPICIOUS_TLDS"
+          fi
+        fi
+
+    # ============================================================================
+    # SECURITY REPORT GENERATION
+    # ============================================================================
+    
+    - name: 📊 Generate Security Report
+      run: |
+        echo "=== SECURITY AUDIT SUMMARY ==="
+        
+        # Create summary report
+        cat > security-report.md << 'EOF'
+        # 🛡️ Security Audit Report
+        
+        **Audit Date:** $(date)
+        **Repository:** ${{ github.repository }}
+        **Commit:** ${{ github.sha }}
+        
+        ## Summary
+        
+        This automated security audit checks for common security issues in browser extensions.
+        
+        ## Checks Performed
+        
+        - ✅ Manifest permission analysis
+        - ✅ Dangerous code pattern detection
+        - ✅ Dependency vulnerability scan
+        - ✅ Static analysis (Semgrep + CodeQL)
+        - ✅ Secret detection
+        - ✅ Code obfuscation check
+        - ✅ License compliance
+        - ✅ External domain analysis
+        
+        ## Critical Issues
+        EOF
+        
+        if [ "$SECURITY_CRITICAL" = "true" ]; then
+          echo "🚨 **CRITICAL SECURITY ISSUES DETECTED**" >> security-report.md
+          echo "" >> security-report.md
+          echo "Please review the workflow logs for details." >> security-report.md
+        else
+          echo "✅ No critical security issues detected in automated scan." >> security-report.md
+        fi
+        
+        echo "" >> security-report.md
+        echo "## Manual Review Required" >> security-report.md
+        echo "" >> security-report.md
+        echo "- [ ] Review all network requests and their necessity" >> security-report.md
+        echo "- [ ] Verify DOM manipulation is properly sanitized" >> security-report.md
+        echo "- [ ] Check that permissions match functionality" >> security-report.md
+        echo "- [ ] Validate all external dependencies" >> security-report.md
+        
+        cat security-report.md
+
+    # ============================================================================
+    # UPLOAD ARTIFACTS
+    # ============================================================================
+    
+    - name: 📤 Upload Security Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-audit-results
+        path: |
+          security-report.md
+          npm-audit.json
+        retention-days: 30
+
+    # ============================================================================
+    # FAIL ON CRITICAL ISSUES
+    # ============================================================================
+    
+    - name: ❌ Fail on Critical Security Issues
+      if: env.SECURITY_CRITICAL == 'true'
+      run: |
+        echo "🚨 CRITICAL SECURITY ISSUES DETECTED!"
+        echo "This workflow is failing to prevent merge of potentially unsafe code."
+        echo "Please review the security audit results above."
+        exit 1
+
+    # ============================================================================
+    # SUCCESS NOTIFICATION
+    # ============================================================================
+    
+    - name: ✅ Security Audit Complete
+      if: env.SECURITY_CRITICAL != 'true'
+      run: |
+        echo "🎉 Security audit completed successfully!"
+        echo "No critical security issues detected in automated scan."
+        echo "Remember: This does not replace manual security review."
