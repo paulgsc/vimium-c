@@ -144,7 +144,7 @@ jobs:
         
         # Install dependencies if package.json exists
         if [ -f "package.json" ]; then
-          npm install --package-lock-only
+          npm install
           
           # Run npm audit
           echo "Running npm audit..."
