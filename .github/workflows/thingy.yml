@@ -136,7 +136,10 @@ jobs:
     # ============================================================================
     # DEPENDENCY SECURITY AUDIT
     # ============================================================================
-    
+
+    - name: Set Default NPM Registry
+      run: npm config set registry https://registry.npmjs.org/
+      
     - name: 📦 NPM Security Audit
       if: hashFiles('package.json') != ''
       run: |
